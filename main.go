@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -22,15 +23,8 @@ const (
 
 type User struct {
 	username string
-	nickname string
 	password string
 	Role
-}
-
-type Client struct {
-	conn net.Conn
-	user *User
-	room *ChatRoom
 }
 
 type ChatRoom struct {
@@ -39,7 +33,13 @@ type ChatRoom struct {
 	clients   map[net.Conn]*Client
 	m         sync.RWMutex
 	maxClient int
-	owner     User
+	owner     *User
+}
+
+type Client struct {
+	conn net.Conn
+	user *User
+	room *ChatRoom
 }
 
 type Server struct {
@@ -58,6 +58,7 @@ var (
 		users:           make(map[string]*User),
 		rooms:           make(map[int]*ChatRoom),
 	}
+	atomicRoomID = 0
 )
 
 func init() {
@@ -114,10 +115,14 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func closeClient(client *Client) {
-	// fmt.Printf("%s quit\n", client.nickname)
-	client.conn.Close()
-	delete(server.clients, client.conn)
+func closeConnection(conn net.Conn) {
+	fmt.Printf("%s connection closed\n", conn.RemoteAddr().String())
+	conn.Close()
+
+	server.m.Lock()
+	defer server.m.Unlock()
+
+	delete(server.clients, conn)
 }
 
 func getHelp() string {
@@ -125,12 +130,112 @@ func getHelp() string {
 command: 
 - /register <username> <password> 
 - /login <username> <password>
-- /change nickname # change your nickname
 - /join <room id> # join one room
+- /delete <room id> # delete one room
+- /leave # leave room
 - /list # show all room info
-- /create # create one chat room
-- /q # quit
+- /create <room name> # create one chat room
+- /send msg
+- /quit
+- /help
 `
+}
+
+func listRoom(client *Client) {
+	server.m.RLock()
+	defer server.m.RUnlock()
+	if len(server.rooms) == 0 {
+		client.conn.Write([]byte("empty room\n"))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Rooms:\n")
+	for id, room := range server.rooms {
+		sb.WriteString(fmt.Sprintf("%d %s\n", id, room.name))
+	}
+	client.conn.Write([]byte(sb.String()))
+}
+
+func deleteRoom(client *Client, roomID int) {
+	if client.user.Role != AdminRole {
+		client.conn.Write([]byte("need admin role\n"))
+		return
+	}
+
+	server.m.Lock()
+	defer server.m.Unlock()
+
+	room, exists := server.rooms[roomID]
+	if !exists {
+		client.conn.Write([]byte("not found room\n"))
+		return
+	}
+
+	for _, v := range room.clients {
+		v.room = nil
+	}
+
+	delete(server.rooms, roomID)
+	client.conn.Write([]byte(fmt.Sprintf("delete %d room\n", roomID)))
+}
+
+func leaveRoom(client *Client) {
+	if client.room == nil {
+		client.conn.Write([]byte("leave: empty room\n"))
+		return
+	}
+
+	client.room.m.Lock()
+	defer client.room.m.Unlock()
+	client.conn.Write([]byte(fmt.Sprintf("leave %d room\n", client.room.id)))
+
+	delete(client.room.clients, client.conn)
+	client.room = nil
+}
+
+func joinRoom(client *Client, roomID int) {
+	server.m.RLock()
+	room, exists := server.rooms[roomID]
+	server.m.RUnlock()
+
+	if !exists {
+		client.conn.Write([]byte(fmt.Sprintf("%d room does not exist\n", roomID)))
+		return
+	}
+
+	if len(room.clients) >= room.maxClient {
+		client.conn.Write([]byte("room is full\n"))
+		return
+	}
+
+	room.m.Lock()
+	defer room.m.Unlock()
+	room.clients[client.conn] = client
+	client.room = room
+	client.conn.Write([]byte(fmt.Sprintf("join room_%d \n", roomID)))
+}
+
+func createRoom(client *Client, name string, maxUsers int) {
+	if client.user.Role != AdminRole {
+		client.conn.Write([]byte("need admin role\n"))
+		return
+	}
+
+	server.m.Lock()
+	defer server.m.Unlock()
+
+	atomicRoomID++
+	room := &ChatRoom{
+		id:        atomicRoomID,
+		name:      name,
+		clients:   make(map[net.Conn]*Client),
+		maxClient: maxUsers,
+		owner:     client.user,
+	}
+
+	server.rooms[atomicRoomID] = room
+	client.conn.Write([]byte(fmt.Sprintf("create room: id %d\n", atomicRoomID)))
 }
 
 func handleUserLogin(conn net.Conn, reader *bufio.Reader) *User {
@@ -148,10 +253,6 @@ func handleUserLogin(conn net.Conn, reader *bufio.Reader) *User {
 
 		command = strings.TrimSpace(command)
 		parts := strings.Split(command, " ")
-		if len(parts) < 3 {
-			conn.Write([]byte("Not accepted.\n" + getHelp()))
-			continue
-		}
 
 		switch parts[0] {
 		case "/register":
@@ -168,26 +269,27 @@ func handleUserLogin(conn net.Conn, reader *bufio.Reader) *User {
 			} else {
 				fmt.Printf("Login Successful %s\n", user.username)
 				conn.Write([]byte("Login successful.\nNow you can join one room.\n"))
+
+				client := &Client{conn: conn, user: user}
+				server.m.Lock()
+				server.clients[conn] = client
+				server.m.Unlock()
+
 				return user
 			}
+		case "/quit":
+			return nil
 		default:
-			conn.Write([]byte("Invalid command.\n"))
+			conn.Write([]byte("Not accepted command. You are not logged in. only support quit/login/register.\n"))
 		}
 	}
 }
 
 func handleConnection(conn net.Conn) {
+	defer func() {
+		closeConnection(conn)
+	}()
 	fmt.Printf("new client: %s\n", conn.RemoteAddr())
-
-	// if len(server.clients) >= server.roomMaxCapacity {
-	// 	fmt.Printf("Too many client, reject %s\n", conn.RemoteAddr())
-	// 	conn.Close()
-	// 	continue
-	// }
-
-	// client := &Client{conn: conn,
-	// 	nickname: fmt.Sprintf("client%d", conn.RemoteAddr().(*net.TCPAddr).Port),
-	// }
 
 	conn.Write([]byte("Welcome to tiny chat server. Please register or login.\n" + getHelp()))
 
@@ -198,7 +300,6 @@ func handleConnection(conn net.Conn) {
 	if user == nil {
 		return
 	}
-	fmt.Printf("Login Successful %s\n", user.username)
 
 	for {
 		command, err := reader.ReadString('\n')
@@ -214,51 +315,71 @@ func handleConnection(conn net.Conn) {
 
 		command = strings.TrimSpace(command)
 		parts := strings.Split(command, " ")
-		if len(parts) < 3 {
-			conn.Write([]byte("Not accepted.\n" + getHelp()))
-			continue
+		// 这里已经可以确保server.clients conn存在
+		switch parts[0] {
+		case "/list":
+			listRoom(server.clients[conn])
+		case "/quit":
+			return
+		case "/delete":
+			if len(parts) != 2 {
+				conn.Write([]byte("not correct command.\n"))
+				continue
+			}
+			roomID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				conn.Write([]byte(err.Error()))
+				continue
+			}
+			deleteRoom(server.clients[conn], roomID)
+		case "/join":
+			if len(parts) != 2 {
+				conn.Write([]byte("not correct command.\n"))
+				continue
+			}
+			roomID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				conn.Write([]byte(err.Error()))
+				continue
+			}
+
+			joinRoom(server.clients[conn], roomID)
+		case "/leave":
+			leaveRoom(server.clients[conn])
+		case "/send":
+			if len(parts) != 2 {
+				conn.Write([]byte("not correct command.\n"))
+				continue
+			}
+			broadcastMessage(server.clients[conn], parts[1])
+		case "/create":
+			if len(parts) != 2 {
+				conn.Write([]byte("not correct command.\n"))
+				continue
+			}
+			createRoom(server.clients[conn], parts[1], server.roomMaxCapacity)
+		case "/help":
+			conn.Write([]byte(getHelp()))
+		default:
+			conn.Write([]byte("unknown command.\n"))
 		}
 	}
+}
 
-	// msg, err := reader.ReadString('\n')
-	// 		if err == io.EOF {
-	// 			closeClient(client)
-	// 			return
-	// 		}
-	// 		if err != nil {
-	// 			fmt.Printf("%s handle error %v\n", client.nickname, err)
-	// 			continue
-	// 		}
-	// 		// remove \r\n
-	// 		msg = strings.TrimSpace(msg)
-	// 		if len(msg) == 0 {
-	// 			continue
-	// 		}
+func broadcastMessage(client *Client, msg string) {
+	if client.room == nil {
+		client.conn.Write([]byte("you should join one room.\n"))
+		return
+	}
+	fmt.Printf("%s broadcast msg to room%d\n", client.user.username, client.room.id)
 
-	// 		if len(msg) > 0 && msg[0] == '/' {
-	// 			parts := strings.SplitN(msg, " ", 2)
-	// 			cmd := parts[0]
-	// 			if cmd == "/c" && len(parts) == 2 {
-	// 				client.nickname = parts[1]
-	// 			}
-	// 			continue
-	// 		}
-
-	// 		if strings.ToLower(msg) == "quit" {
-	// 			closeClient(client)
-	// 			return
-	// 		}
-
-	// wrappedMsg := fmt.Sprintf("%s: %s\n", client.nickname, msg)
-	// fmt.Print(wrappedMsg)
-	// server.m.RLock()
-	//
-	//	for k, v := range server.clients {
-	//		if k == client.conn {
-	//			continue
-	//		}
-	//		v.conn.Write([]byte(wrappedMsg))
-	//	}
-	//
-	// server.m.RUnlock()
+	wrappedMsg := fmt.Sprintf("%s: %s\n", client.user.username, msg)
+	client.room.m.RLock()
+	defer client.room.m.RUnlock()
+	for k := range client.room.clients {
+		if k == client.conn {
+			continue
+		}
+		k.Write([]byte(wrappedMsg))
+	}
 }
